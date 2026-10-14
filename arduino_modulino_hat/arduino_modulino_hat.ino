@@ -1,5 +1,5 @@
 /**
- * Modulino LED Matrix + Sensors + Built-in Nano R4 RTC Hourly Vibration Chime
+ * Modulino LED Matrix + Sensors + Built-in Nano R4 RTC Hourly Vibration Chime + Buzzer
  */
 #include "ArduinoGraphics.h"
 #include <Arduino_Modulino.h>
@@ -12,7 +12,7 @@
 #include "RTC.h"
 
 // --- RTC TRACKING ---
-int lastVibratedHour = -1; // Tracks the hour of the last hourly chime
+int lastVibratedHour = -1; 
 
 // --- TASK SCHEDULING TIMERS ---
 unsigned long lastScrollTime = 0;
@@ -22,6 +22,15 @@ unsigned long lastRtcCheckTime = 0;
 
 int currentScrollFrame = 0;
 int scrollSpeed = 70; 
+
+// --- COUNTDOWN & BLINKING STATE ---
+bool isCountdownActive = false;
+unsigned long countdownStartTime = 0;
+int lastCountdownSecond = -1;
+
+bool isGoBlinkingActive = false;
+unsigned long goBlinkStartTime = 0;
+bool goIsCurrentlyOn = false;
 
 // --- NON-BLOCKING HOURLY VIBRATION CHIME STATE MACHINE ---
 int pendingVibrations = 0;
@@ -36,8 +45,8 @@ struct MatrixFrame {
 };
 
 // --- ANIMATION GENERATOR CONFIGURATIONS ---
-constexpr int SCROLL_LEN = 17; 
-constexpr char SCROLL_STR[] = "   OSHWDEM 26   ";
+constexpr int SCROLL_LEN = 19; 
+constexpr char SCROLL_STR[] = "   UPV HACKATHON   ";
 constexpr int TOTAL_COLS = 12 + (SCROLL_LEN * 6) + 12; 
 constexpr int TOTAL_FRAMES = TOTAL_COLS - 11; 
 
@@ -60,7 +69,6 @@ constexpr uint8_t getCharCol(char c, int col) {
     if (c >= 'a' && c <= 'z') c -= 32; 
     
     switch (c) {
-        // --- NUMBERS ---
         case '0': { uint8_t f[] = {0xFF, 0x81, 0x81, 0x81, 0xFF}; return f[col]; }
         case '1': { uint8_t f[] = {0x80, 0x82, 0xFF, 0x80, 0x80}; return f[col]; }
         case '2': { uint8_t f[] = {0xC2, 0xA1, 0x91, 0x89, 0x86}; return f[col]; }
@@ -71,8 +79,6 @@ constexpr uint8_t getCharCol(char c, int col) {
         case '7': { uint8_t f[] = {0x01, 0x01, 0x01, 0x01, 0xFF}; return f[col]; }
         case '8': { uint8_t f[] = {0x76, 0x89, 0x89, 0x89, 0x76}; return f[col]; }
         case '9': { uint8_t f[] = {0x0E, 0x11, 0x11, 0x11, 0xFF}; return f[col]; }
-        
-        // --- LETTERS ---
         case 'A': { uint8_t f[] = {0xFE, 0x09, 0x09, 0x09, 0xFE}; return f[col]; }
         case 'B': { uint8_t f[] = {0xFF, 0x89, 0x89, 0x89, 0x76}; return f[col]; }
         case 'C': { uint8_t f[] = {0x7E, 0x81, 0x81, 0x81, 0x42}; return f[col]; }
@@ -99,7 +105,6 @@ constexpr uint8_t getCharCol(char c, int col) {
         case 'X': { uint8_t f[] = {0xE3, 0x14, 0x08, 0x14, 0xE3}; return f[col]; }
         case 'Y': { uint8_t f[] = {0x03, 0x0C, 0xF0, 0x0C, 0x03}; return f[col]; }
         case 'Z': { uint8_t f[] = {0xC1, 0xA1, 0x91, 0x89, 0x87}; return f[col]; }
-        
         case ' ': default: return 0x00;
     }
 }
@@ -149,6 +154,21 @@ constexpr ScrollAnimationK generateScrollK() {
 constexpr ScrollAnimation ANIM_ROBOCON = generateScroll();
 constexpr ScrollAnimationK ANIM_KARIBU = generateScrollK();
 
+// --- STATIC "GO" GENERATOR ---
+constexpr MatrixFrame makeGoFrame() {
+    uint8_t cols[12] = {0}; 
+    cols[0] = 0x7E; cols[1] = 0x81; cols[2] = 0x91; cols[3] = 0x91; cols[4] = 0x72;
+    cols[7] = 0x7E; cols[8] = 0x81; cols[9] = 0x81; cols[10] = 0x81; cols[11] = 0x7E;
+    
+    MatrixFrame frame = {0, 0, 0, 66}; 
+    frame.data[0] = ((uint32_t)cols[0] << 24) | ((uint32_t)cols[1] << 16) | ((uint32_t)cols[2] << 8) | (uint32_t)cols[3];
+    frame.data[1] = ((uint32_t)cols[4] << 24) | ((uint32_t)cols[5] << 16) | ((uint32_t)cols[6] << 8) | (uint32_t)cols[7];
+    frame.data[2] = ((uint32_t)cols[8] << 24) | ((uint32_t)cols[9] << 16) | ((uint32_t)cols[10] << 8) | (uint32_t)cols[11];
+    return frame;
+}
+constexpr MatrixFrame FRAME_GO = makeGoFrame();
+
+
 ModulinoLEDMatrix matrix_1;
 ModulinoLEDMatrix matrix_2(0x40);
 ModulinoLEDMatrix matrix_3(0x41);
@@ -157,6 +177,7 @@ ModulinoThermo thermo;
 ModulinoLight light;
 ModulinoButtons buttons;
 ModulinoVibro vibro;
+ModulinoBuzzer buzzer;
 
 float celsius = 0;
 int matrix2_mode = 0; 
@@ -210,7 +231,7 @@ void updateVibration() {
     }
   } else {
     if (pendingVibrations > 0 && (now - lastVibroToggleTime >= VIBRO_OFF_MS)) {
-      vibro.on(100);
+      vibro.on(255); // Max power
       vibroState = true;
       lastVibroToggleTime = now;
     }
@@ -221,13 +242,11 @@ void setup() {
   Modulino.begin();
   Wire.setClock(400000); 
 
-  // --- Arduino Nano R4 Built-in RTC Initialization ---
   RTC.begin();
 
   RTCTime savedTime;
   RTC.getTime(savedTime);
   
-  // Set time only if the RTC is not already running (preserves battery backup time if VBATT is connected)
   if (!RTC.isRunning()) {
     RTCTime startTime(15, Month::OCTOBER, 2026, 9, 59, 0, DayOfWeek::MONDAY, SaveLight::SAVING_TIME_INACTIVE);
     RTC.setTime(startTime);
@@ -240,6 +259,7 @@ void setup() {
   light.begin();
   buttons.begin();
   vibro.begin();
+  buzzer.begin();
 
   matrix_1.clear();
   matrix_2.clear();
@@ -253,25 +273,20 @@ void setup() {
 
 void loop() {
 
-  // Non-blocking vibration motor tick
   updateVibration();
 
-  // --- RTC HOURLY CHECK (Check once every 1 second) ---
+  // --- RTC HOURLY CHECK ---
   if (millis() - lastRtcCheckTime >= 1000) {
     lastRtcCheckTime = millis();
     
     RTCTime currentTime;
     RTC.getTime(currentTime);
-    int currentHour = currentTime.getHour(); // Returns hour (0 to 23)
+    int currentHour = currentTime.getHour(); 
 
-    // Trigger chime on new hour arrival
     if (currentHour != lastVibratedHour) {
       lastVibratedHour = currentHour;
-
-      // 12-hour format calculation: 1 AM -> 1, 10 PM (22:00) -> 10, 12 AM/PM -> 12
       int count = currentHour % 12;
       if (count == 0) count = 12;
-
       pendingVibrations = count;
     }
   }
@@ -279,103 +294,169 @@ void loop() {
   // --- TIER 0: INSTANT ACTIONS ---
   if (buttons.update()) {
     if (buttons.isPressed(0)) {
-      vibro.on(500);
-      delay(500);
-      vibro.off();
-      delay(250);
-
+      pendingVibrations = 1;
       matrix2_mode = 0;
       matrix_2.setFrame(LEDMATRIX_ARDUINO_LOOP);
+      
     } else if (buttons.isPressed(1)) {
-      vibro.on(250);
-      delay(250);
-      vibro.off();
-      delay(250);
-
-      vibro.on(250);
-      delay(250);
-      vibro.off();
-      delay(250);
-
+      pendingVibrations = 2;
       matrix2_mode = 1;
       currentScrollFrame = 0; 
+      
     } else if (buttons.isPressed(2)) {
-      vibro.on(250);
-      delay(250);
-      vibro.off();
-      delay(250);
-
-      vibro.on(250);
-      delay(250);
-      vibro.off();
-      delay(250);
-
-      vibro.on(250);
-      delay(250);
-      vibro.off();
-      delay(250);
-
       matrix2_mode = 2;
       currentScrollFrame = 0; 
+      
+      // --- START THE COUNTDOWN ---
+      isCountdownActive = true;
+      isGoBlinkingActive = false; 
+      countdownStartTime = millis();
+      lastCountdownSecond = -1; 
     }
   }
   
-  // --- TIER 1: FAST TIMER (Text Scrolling) ---
-  if (millis() - lastScrollTime >= scrollSpeed) {
-    lastScrollTime = millis();
-
-    if (matrix2_mode == 1) {
-      matrix_2.setFrame(ANIM_ROBOCON.frames[currentScrollFrame]);
-      currentScrollFrame += 2; 
-      if (currentScrollFrame >= TOTAL_FRAMES) currentScrollFrame = 0; 
+  // --- OVERRIDE TIER 1: GLOBAL COUNTDOWN ---
+  if (isCountdownActive) {
+    unsigned long elapsed = millis() - countdownStartTime;
+    
+    if (elapsed < 3000) {
+      // Calculate which second we are on (3, 2, or 1)
+      int currentSecond = 3 - (elapsed / 1000); 
       
-    } else if (matrix2_mode == 2) {
-      matrix_2.setFrame(ANIM_KARIBU.frames[currentScrollFrame]);
-      currentScrollFrame += 2; 
-      if (currentScrollFrame >= TOTAL_FRAMES_K) currentScrollFrame = 0; 
+      if (currentSecond != lastCountdownSecond) {
+        lastCountdownSecond = currentSecond;
+        
+        matrix_1.setFrame(NUMBERS_0_TO_50[currentSecond]);
+        matrix_2.setFrame(NUMBERS_0_TO_50[currentSecond]);
+        matrix_3.clear(); 
+        matrix_3.setFrame(NUMBERS_0_TO_50[currentSecond]);
+
+        // 1. Trigger haptic pulse!
+        vibro.on(255);
+        vibroState = true;
+        lastVibroToggleTime = millis();
+        pendingVibrations = 0; 
+        
+        // 2. Trigger Mario Kart "Ready" Beep (1047 Hz / C6 for 150ms)
+        buzzer.tone(1047, 150); 
+      }
+    } else {
+      // 3 seconds are up! Transition directly to "GO" Blinking
+      isCountdownActive = false;
+      isGoBlinkingActive = true;
+      goBlinkStartTime = millis();
+      goIsCurrentlyOn = false; 
+
+      // --- NEW: Trigger ONE continuous 1500ms beep spanning all three "GO" flashes! ---
+      buzzer.tone(2093, 1500); 
+    }
+  } 
+  
+  // --- OVERRIDE TIER 2: "GO" BLINKING ---
+  else if (isGoBlinkingActive) {
+    unsigned long elapsed = millis() - goBlinkStartTime;
+    
+    // We want 3 blinks. Each blink lasts 500ms (300ms ON, 200ms OFF)
+    if (elapsed < 1500) {
+      bool shouldBeOn = (elapsed % 500) < 300; 
+      
+      if (shouldBeOn != goIsCurrentlyOn) {
+        goIsCurrentlyOn = shouldBeOn;
+        
+        if (shouldBeOn) {
+          // Flash the "GO" frames!
+          matrix_1.setFrame(FRAME_GO.data);
+          matrix_2.setFrame(FRAME_GO.data);
+          matrix_3.clear();
+          matrix_3.setFrame(FRAME_GO.data);
+          
+          // Trigger vibration pulse (buzzer is already ringing continuously in the background!)
+          vibro.on(255);
+          vibroState = true;
+          lastVibroToggleTime = millis();
+          pendingVibrations = 0; 
+          
+        } else {
+          // Clear screens during the OFF phase of the blink
+          matrix_1.clear();
+          matrix_2.clear();
+          matrix_3.clear();
+        }
+      }
+    } else {
+      // Blinking is finished! Restore normal screens
+      isGoBlinkingActive = false;
+      
+      int tempIdx = int(celsius);
+      if (tempIdx >= 0 && tempIdx <= 50) {
+        matrix_1.setFrame(NUMBERS_0_TO_50[tempIdx]);
+      }
+      matrix_3.clear(); 
     }
   }
+  
+  // --- NORMAL ANIMATION TIERS (Only run if NO countdown or blinking is active) ---
+  else {
+    
+    // --- TIER 1: FAST TIMER (Text Scrolling) ---
+    if (millis() - lastScrollTime >= scrollSpeed) {
+      lastScrollTime = millis();
 
-  // --- TIER 2: MEDIUM TIMER (IR Sensor & Heatwave) ---
-  if (millis() - lastHeatwaveTime >= 40) {
-    lastHeatwaveTime = millis(); 
-
-    light.update();
-    int ir = light.getIR();
-
-    int sensorValue = ir; 
-    if (sensorValue > 1023) sensorValue = 1023;
-    if (sensorValue < 0) sensorValue = 0;
-
-    float baseHeight = sensorValue * (6.0 / 1023.0);
-
-    matrix_3.clear();
-    matrix_3.beginDraw();
-    matrix_3.stroke(0xFFFFFF); 
-
-    for (int x = 0; x < 12; x++) {
-      float mountainHeight = sin(x * (3.14159 / 11.0)) * 2.0; 
-      int totalHeight = round(baseHeight + mountainHeight);
-      
-      if (totalHeight > 8) totalHeight = 8;
-      if (totalHeight < 0) totalHeight = 0;
-
-      if (totalHeight > 0) {
-        int startY = 8 - totalHeight;
-        matrix_3.line(x, startY, x, 7);
+      if (matrix2_mode == 1) {
+        matrix_2.setFrame(ANIM_ROBOCON.frames[currentScrollFrame]);
+        currentScrollFrame += 2; 
+        if (currentScrollFrame >= TOTAL_FRAMES) currentScrollFrame = 0; 
+        
+      } else if (matrix2_mode == 2) {
+        matrix_2.setFrame(ANIM_KARIBU.frames[currentScrollFrame]);
+        currentScrollFrame += 2; 
+        if (currentScrollFrame >= TOTAL_FRAMES_K) currentScrollFrame = 0; 
       }
     }
-    matrix_3.endDraw(); 
+
+    // --- TIER 2: MEDIUM TIMER (IR Sensor & Heatwave) ---
+    if (millis() - lastHeatwaveTime >= 40) {
+      lastHeatwaveTime = millis(); 
+
+      light.update();
+      int ir = light.getIR();
+
+      int sensorValue = ir; 
+      if (sensorValue > 1023) sensorValue = 1023;
+      if (sensorValue < 0) sensorValue = 0;
+
+      float baseHeight = sensorValue * (6.0 / 1023.0);
+
+      matrix_3.clear();
+      matrix_3.beginDraw();
+      matrix_3.stroke(0xFFFFFF); 
+
+      for (int x = 0; x < 12; x++) {
+        float mountainHeight = sin(x * (3.14159 / 11.0)) * 2.0; 
+        int totalHeight = round(baseHeight + mountainHeight);
+        
+        if (totalHeight > 8) totalHeight = 8;
+        if (totalHeight < 0) totalHeight = 0;
+
+        if (totalHeight > 0) {
+          int startY = 8 - totalHeight;
+          matrix_3.line(x, startY, x, 7);
+        }
+      }
+      matrix_3.endDraw(); 
+    }
   }
 
   // --- TIER 3: SLOW TIMER (Thermometer) ---
   if (millis() - lastThermoTime >= 2000) {
     lastThermoTime = millis(); 
-    
     celsius = thermo.getTemperature();
-    int tempIdx = int(celsius);
-    if (tempIdx >= 0 && tempIdx <= 50) {
-      matrix_1.setFrame(NUMBERS_0_TO_50[tempIdx]);
+    
+    if (!isCountdownActive && !isGoBlinkingActive) {
+      int tempIdx = int(celsius);
+      if (tempIdx >= 0 && tempIdx <= 50) {
+        matrix_1.setFrame(NUMBERS_0_TO_50[tempIdx]);
+      }
     }
   }
 }
