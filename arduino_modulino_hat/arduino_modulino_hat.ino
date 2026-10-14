@@ -1,6 +1,5 @@
 /**
- * This example shows how to use the Modulino LED Matrix library to display
- * basic graphics and animations on the Modulino LED Matrix display.
+ * Modulino LED Matrix + Sensors + Built-in Nano R4 RTC Hourly Vibration Chime
  */
 #include "ArduinoGraphics.h"
 #include <Arduino_Modulino.h>
@@ -9,20 +8,32 @@
 #include "matrix_collection.h"
 #include <math.h>
 
+// Built-in RTC Library for Arduino Renesas (Nano R4 / UNO R4)
+#include "RTC.h"
+
+// --- RTC TRACKING ---
+int lastVibratedHour = -1; // Tracks the hour of the last hourly chime
+
 // --- TASK SCHEDULING TIMERS ---
 unsigned long lastScrollTime = 0;
 unsigned long lastHeatwaveTime = 0;
 unsigned long lastThermoTime = 0;
+unsigned long lastRtcCheckTime = 0;
 
 int currentScrollFrame = 0;
-int scrollSpeed = 70; // 15ms is incredibly fast! Adjust if it's too quick.
+int scrollSpeed = 70; 
 
-// --- 1. FORCE STRUCT DEFINITIONS TO THE TOP ---
+// --- NON-BLOCKING HOURLY VIBRATION CHIME STATE MACHINE ---
+int pendingVibrations = 0;
+bool vibroState = false;
+unsigned long lastVibroToggleTime = 0;
+constexpr unsigned long VIBRO_ON_MS  = 200; // Duration of vibration pulse
+constexpr unsigned long VIBRO_OFF_MS = 300; // Pause between pulses
+
+// --- FORCE STRUCT DEFINITIONS TO THE TOP ---
 struct MatrixFrame {
     uint32_t data[4];
 };
-
-
 
 // --- ANIMATION GENERATOR CONFIGURATIONS ---
 constexpr int SCROLL_LEN = 17; 
@@ -45,8 +56,8 @@ struct ScrollAnimationK {
 
 // Map ALL uppercase letters (A-Z) and numbers (0-9)
 constexpr uint8_t getCharCol(char c, int col) {
-    if (col >= 5) return 0x00; // 1 pixel spacing between letters
-    if (c >= 'a' && c <= 'z') c -= 32; // Force uppercase
+    if (col >= 5) return 0x00; 
+    if (c >= 'a' && c <= 'z') c -= 32; 
     
     switch (c) {
         // --- NUMBERS ---
@@ -93,7 +104,6 @@ constexpr uint8_t getCharCol(char c, int col) {
     }
 }
 
-// Generate columns for ROBOCON
 constexpr uint8_t getScrollColumn(int colIndex) {
     if (colIndex < 12) return 0x00; 
     int textCol = colIndex - 12;
@@ -102,7 +112,6 @@ constexpr uint8_t getScrollColumn(int colIndex) {
     return getCharCol(SCROLL_STR[charIndex], textCol % 6);
 }
 
-// Generate columns for KARIBU
 constexpr uint8_t getScrollColumnK(int colIndex) {
     if (colIndex < 12) return 0x00; 
     int textCol = colIndex - 12;
@@ -111,7 +120,6 @@ constexpr uint8_t getScrollColumnK(int colIndex) {
     return getCharCol(SCROLL_STR_K[charIndex], textCol % 6);
 }
 
-// Build the ROBOCON frame animation at compile time
 constexpr ScrollAnimation generateScroll() {
     ScrollAnimation anim = {};
     for (int f = 0; f < TOTAL_FRAMES; f++) {
@@ -125,7 +133,6 @@ constexpr ScrollAnimation generateScroll() {
     return anim;
 }
 
-// Build the KARIBU frame animation at compile time
 constexpr ScrollAnimationK generateScrollK() {
     ScrollAnimationK anim = {};
     for (int f = 0; f < TOTAL_FRAMES_K; f++) {
@@ -139,7 +146,6 @@ constexpr ScrollAnimationK generateScrollK() {
     return anim;
 }
 
-// Instantiate both animations!
 constexpr ScrollAnimation ANIM_ROBOCON = generateScroll();
 constexpr ScrollAnimationK ANIM_KARIBU = generateScrollK();
 
@@ -150,11 +156,11 @@ ModulinoLEDMatrix matrix_3(0x41);
 ModulinoThermo thermo;
 ModulinoLight light;
 ModulinoButtons buttons;
+ModulinoVibro vibro;
 
 float celsius = 0;
 int matrix2_mode = 0; 
 
-// Matrix Numbers Generation
 constexpr uint8_t FONT_5x8[10][5] = {
     { 0xFF, 0x81, 0x81, 0x81, 0xFF }, { 0x80, 0x82, 0xFF, 0x80, 0x80 },
     { 0xC2, 0xA1, 0x91, 0x89, 0x86 }, { 0x42, 0x81, 0x89, 0x89, 0x76 },
@@ -189,11 +195,43 @@ constexpr uint32_t NUMBERS_0_TO_50[51][4] = {
     GEN_FRAME(40), GEN_FRAME(41), GEN_FRAME(42), GEN_FRAME(43), GEN_FRAME(44), GEN_FRAME(45), GEN_FRAME(46), GEN_FRAME(47), GEN_FRAME(48), GEN_FRAME(49), GEN_FRAME(50)
 };
 
+// Non-blocking handler for async vibration chimes
+void updateVibration() {
+  if (pendingVibrations <= 0 && !vibroState) return;
+
+  unsigned long now = millis();
+
+  if (vibroState) {
+    if (now - lastVibroToggleTime >= VIBRO_ON_MS) {
+      vibro.off();
+      vibroState = false;
+      lastVibroToggleTime = now;
+      pendingVibrations--;
+    }
+  } else {
+    if (pendingVibrations > 0 && (now - lastVibroToggleTime >= VIBRO_OFF_MS)) {
+      vibro.on(100);
+      vibroState = true;
+      lastVibroToggleTime = now;
+    }
+  }
+}
+
 void setup() {
   Modulino.begin();
-  
-  // Kick I2C into Fast Mode to handle 5 modules simultaneously!
   Wire.setClock(400000); 
+
+  // --- Arduino Nano R4 Built-in RTC Initialization ---
+  RTC.begin();
+
+  RTCTime savedTime;
+  RTC.getTime(savedTime);
+  
+  // Set time only if the RTC is not already running (preserves battery backup time if VBATT is connected)
+  if (!RTC.isRunning()) {
+    RTCTime startTime(15, Month::OCTOBER, 2026, 9, 59, 0, DayOfWeek::MONDAY, SaveLight::SAVING_TIME_INACTIVE);
+    RTC.setTime(startTime);
+  }
 
   thermo.begin();
   matrix_1.begin();
@@ -201,6 +239,7 @@ void setup() {
   matrix_3.begin();
   light.begin();
   buttons.begin();
+  vibro.begin();
 
   matrix_1.clear();
   matrix_2.clear();
@@ -209,44 +248,90 @@ void setup() {
   matrix2_mode = 0;
   matrix_2.setFrame(LEDMATRIX_ARDUINO_LOOP);
   
-  // Initialize the slow timer so it triggers immediately on boot
   lastThermoTime = millis();
 }
 
 void loop() {
 
+  // Non-blocking vibration motor tick
+  updateVibration();
+
+  // --- RTC HOURLY CHECK (Check once every 1 second) ---
+  if (millis() - lastRtcCheckTime >= 1000) {
+    lastRtcCheckTime = millis();
+    
+    RTCTime currentTime;
+    RTC.getTime(currentTime);
+    int currentHour = currentTime.getHour(); // Returns hour (0 to 23)
+
+    // Trigger chime on new hour arrival
+    if (currentHour != lastVibratedHour) {
+      lastVibratedHour = currentHour;
+
+      // 12-hour format calculation: 1 AM -> 1, 10 PM (22:00) -> 10, 12 AM/PM -> 12
+      int count = currentHour % 12;
+      if (count == 0) count = 12;
+
+      pendingVibrations = count;
+    }
+  }
+
   // --- TIER 0: INSTANT ACTIONS ---
   if (buttons.update()) {
     if (buttons.isPressed(0)) {
+      vibro.on(500);
+      delay(500);
+      vibro.off();
+      delay(250);
+
       matrix2_mode = 0;
       matrix_2.setFrame(LEDMATRIX_ARDUINO_LOOP);
     } else if (buttons.isPressed(1)) {
+      vibro.on(250);
+      delay(250);
+      vibro.off();
+      delay(250);
+
+      vibro.on(250);
+      delay(250);
+      vibro.off();
+      delay(250);
+
       matrix2_mode = 1;
       currentScrollFrame = 0; 
     } else if (buttons.isPressed(2)) {
+      vibro.on(250);
+      delay(250);
+      vibro.off();
+      delay(250);
+
+      vibro.on(250);
+      delay(250);
+      vibro.off();
+      delay(250);
+
+      vibro.on(250);
+      delay(250);
+      vibro.off();
+      delay(250);
+
       matrix2_mode = 2;
       currentScrollFrame = 0; 
     }
   }
   
-// --- TIER 1: FAST TIMER (Text Scrolling) ---
+  // --- TIER 1: FAST TIMER (Text Scrolling) ---
   if (millis() - lastScrollTime >= scrollSpeed) {
     lastScrollTime = millis();
 
     if (matrix2_mode == 1) {
       matrix_2.setFrame(ANIM_ROBOCON.frames[currentScrollFrame]);
-      
-      // THE MAGIC FIX: Shift by 2 or 3 pixels instead of 1!
       currentScrollFrame += 2; 
-      
       if (currentScrollFrame >= TOTAL_FRAMES) currentScrollFrame = 0; 
       
     } else if (matrix2_mode == 2) {
       matrix_2.setFrame(ANIM_KARIBU.frames[currentScrollFrame]);
-      
-      // THE MAGIC FIX: Shift by 2 or 3 pixels instead of 1!
       currentScrollFrame += 2; 
-      
       if (currentScrollFrame >= TOTAL_FRAMES_K) currentScrollFrame = 0; 
     }
   }
@@ -283,12 +368,14 @@ void loop() {
     matrix_3.endDraw(); 
   }
 
-  // --- TIER 3: SLOW TIMER (The Culprit: Thermometer) ---
-  // This heavily blocking function now only ruins our speed once every 2 seconds!
+  // --- TIER 3: SLOW TIMER (Thermometer) ---
   if (millis() - lastThermoTime >= 2000) {
     lastThermoTime = millis(); 
     
     celsius = thermo.getTemperature();
-    matrix_1.setFrame(NUMBERS_0_TO_50[int(celsius)]);
+    int tempIdx = int(celsius);
+    if (tempIdx >= 0 && tempIdx <= 50) {
+      matrix_1.setFrame(NUMBERS_0_TO_50[tempIdx]);
+    }
   }
 }
